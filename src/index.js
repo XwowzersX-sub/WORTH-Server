@@ -130,7 +130,8 @@ function newPlayer(client, index) {
     vx: 0, vy: 0, vz: 0,
     yaw: index === 0 ? Math.PI / 4 : -3 * Math.PI / 4,
     onGround: true,
-    input: { keys: [], yaw: 0, roll: false, crouch: false, aim: false },
+    input: { keys: [], yaw: 0, roll: false, crouch: false, sprint: false, sprinting: false, aim: false },
+    stamina: 100,
     previousKeys: new Set(),
     score: 0,
     roundWins: 0,
@@ -260,7 +261,12 @@ function updatePlayer(player, dt) {
   if (keys.has('KeyA')) { ix -= right.x; iz -= right.z; }
   const length = Math.hypot(ix, iz);
   if (length > 0) { ix /= length; iz /= length; }
-  let speed = 6.0 + player.upgrades.moveSpeed * .28;
+  const moving = length > .01;
+  const sprinting = !!(player.input.sprint && moving && !player.input.crouch && !player.input.roll && player.stamina > 0);
+  player.stamina = clamp(player.stamina + (sprinting ? -32 : 22) * dt, 0, 100);
+  player.input.sprinting = sprinting;
+  let speed = 6.1 + player.upgrades.moveSpeed * .35;
+  if (sprinting) speed *= 1.48;
   if (player.input.crouch) speed *= .55;
   if (player.input.roll) speed *= 1.65;
   const targetX = ix * speed, targetZ = iz * speed;
@@ -273,7 +279,7 @@ function updatePlayer(player, dt) {
     player.vz = ((player.input.rollZ || -1) / d) * speed;
   }
   if (keys.has('Space') && !player.previousKeys.has('Space') && player.onGround) {
-    player.vy = 8.1 + player.upgrades.jump * .26;
+    player.vy = 8.1 + player.upgrades.jump * .35;
     player.onGround = false;
   }
   player.previousKeys = keys;
@@ -314,7 +320,7 @@ function tickRoom(room, dt, now) {
         timeScale,
         selfId: p.id,
         map: room.map,
-        players: room.players.map(q => ({ id: q.id, name: q.name, x: q.x, y: q.y, z: q.z, yaw: q.yaw })),
+        players: room.players.map(q => ({ id: q.id, name: q.name, x: q.x, y: q.y, z: q.z, yaw: q.yaw, stamina: q.stamina, sprinting: q.input.sprinting, rolling: q.input.roll })),
         score: { self: p.score, opponent: opponent.score },
         roundWins: { self: p.roundWins, opponent: opponent.roundWins },
         zoneOwner: room.zoneOwner === p.id ? 'self' : room.zoneOwner === opponent.id ? 'opponent' : room.zoneOwner === 'contested' ? 'contested' : null,
@@ -372,8 +378,9 @@ async function handleMessage(client, raw) {
     p.input.roll = !!msg.roll;
     p.input.crouch = !!msg.crouch;
     p.input.aim = !!msg.aim;
-    p.input.rollX = Math.sin(p.yaw);
-    p.input.rollZ = -Math.cos(p.yaw);
+    p.input.sprint = !!msg.sprint;
+    p.input.rollX = Number.isFinite(msg.rollX) ? clamp(msg.rollX, -1, 1) : Math.sin(p.yaw);
+    p.input.rollZ = Number.isFinite(msg.rollZ) ? clamp(msg.rollZ, -1, 1) : -Math.cos(p.yaw);
   }
 }
 
