@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: worth-server
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: 22
+      - key: SUPABASE_URL
+        value: https://rkenxijtbmiqcgwhvtgr.supabase.co
+      - key: SUPABASE_PUBLISHABLE_KEY
+        value: sb_publishable_MPWfzhBBPHCTjz-mH3ff4Q_8G1XSfnm
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: CLIENT_ORIGIN
+        value: https://xwowzersx-sub.github.io
