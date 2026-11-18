@@ -287,6 +287,10 @@ function updatePlayer(player, dt) {
   const smoothing = 1 - Math.exp(-11 * dt);
   player.vx += (targetX - player.vx) * smoothing;
   player.vz += (targetZ - player.vz) * smoothing;
+  if (player.input.roll) {
+    player.vx += (targetX - player.vx) * .22;
+    player.vz += (targetZ - player.vz) * .22;
+  }
   if (keys.has('Space') && !player.previousKeys.has('Space') && player.onGround) {
     player.vy = 8.1 + player.upgrades.jump * .35;
     player.onGround = false;
