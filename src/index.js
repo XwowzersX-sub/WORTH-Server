@@ -266,8 +266,15 @@ function updatePlayer(player, dt) {
   if (keys.has('KeyS')) { ix -= forward.x; iz -= forward.z; }
   if (keys.has('KeyD')) { ix += right.x; iz += right.z; }
   if (keys.has('KeyA')) { ix -= right.x; iz -= right.z; }
-  const length = Math.hypot(ix, iz);
-  if (length > 0) { ix /= length; iz /= length; }
+  let length = Math.hypot(ix, iz);
+  if (player.input.roll) {
+    const rollLength = Math.hypot(player.input.rollX || 0, player.input.rollZ || -1) || 1;
+    ix = (player.input.rollX || 0) / rollLength;
+    iz = (player.input.rollZ || -1) / rollLength;
+    length = 1;
+  } else if (length > 0) {
+    ix /= length; iz /= length;
+  }
   const moving = length > .01;
   const sprinting = !!(player.input.sprint && moving && !player.input.crouch && !player.input.roll && player.stamina > 0);
   player.stamina = clamp(player.stamina + (sprinting ? -32 : 22) * dt, 0, 100);
@@ -280,11 +287,6 @@ function updatePlayer(player, dt) {
   const smoothing = 1 - Math.exp(-11 * dt);
   player.vx += (targetX - player.vx) * smoothing;
   player.vz += (targetZ - player.vz) * smoothing;
-  if (player.input.roll && length < .01) {
-    const d = Math.hypot(player.input.rollX || 0, player.input.rollZ || -1) || 1;
-    player.vx = ((player.input.rollX || 0) / d) * speed;
-    player.vz = ((player.input.rollZ || -1) / d) * speed;
-  }
   if (keys.has('Space') && !player.previousKeys.has('Space') && player.onGround) {
     player.vy = 8.1 + player.upgrades.jump * .35;
     player.onGround = false;
@@ -345,7 +347,9 @@ async function handleMessage(client, raw) {
     client.authPromise = (async () => {
       const user = await verifyToken(msg.token);
       client.userId = user?.id || null;
-      client.id = user?.id || client.guestId;
+      // A player ID belongs to this live connection, not the account.
+      // This allows the same account to open a second test session safely.
+      client.id = client.guestId;
       client.name = safeName(msg.nickname || user?.user_metadata?.nickname || 'Rookie');
       send(client, { type: 'hello', playerId: client.id, authenticated: !!user, nickname: client.name });
     })();
