@@ -177,6 +177,13 @@ function resetRound(room) {
     p.vx = 0; p.vy = 0; p.vz = 0;
     p.score = 0;
     p.zoneHold = 0;
+    p.stamina = 100;
+    p.input.keys = [];
+    p.input.roll = false;
+    p.input.crouch = false;
+    p.input.sprint = false;
+    p.input.sprinting = false;
+    p.input.aim = false;
     p.previousKeys.clear();
   }
 }
