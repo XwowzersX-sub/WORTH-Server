@@ -32,6 +32,13 @@ const wss = new WebSocketServer({ noServer: true, maxPayload: 4096, perMessageDe
 
 const MAPS = ['Neon Foundry','Skybridge','Dustpoint','Glacier Run','Orbit Yard'];
 const MODES = ['loadout','addition'];
+const MATCH_FORMATS = {
+  '1v1': { size: 2, sides: 2, ffa: false },
+  '2v2': { size: 4, sides: 2, ffa: false },
+  '3v3': { size: 6, sides: 2, ffa: false },
+  '5v5': { size: 10, sides: 2, ffa: false },
+  '1v1v1': { size: 3, sides: 3, ffa: true }
+};
 const rooms = new Map();
 const queues = new Map();
 const sockets = new Map();
@@ -53,6 +60,7 @@ function send(client, payload) {
 }
 function validMap(value) { return MAPS.includes(value) ? value : MAPS[0]; }
 function validMode(value) { return MODES.includes(value) ? value : 'loadout'; }
+function validMatchFormat(value) { return MATCH_FORMATS[value] ? value : '1v1'; }
 function clamp(value, min, max) { return Math.max(min, Math.min(max, value)); }
 function safeUpgrades(input) {
   const keys = ['moveSpeed','jump','stamina','recharge','zoneControl'];
@@ -85,7 +93,7 @@ async function verifyToken(token) {
   }
 }
 
-function queueKey(map, mode) { return map + '::' + mode; }
+function queueKey(format, mode) { return format + '::' + mode; }
 function removeFromQueue(client) {
   if (!client.queueKey) return;
   const q = queues.get(client.queueKey) || [];
@@ -97,86 +105,155 @@ function removeFromQueue(client) {
 function queueClient(client, request) {
   if (client.roomId) return;
   removeFromQueue(client);
-  const map = validMap(request.map);
+  const format = validMatchFormat(request.matchFormat);
   const mode = validMode(request.mode);
+  const required = MATCH_FORMATS[format].size;
+  client.matchFormat = format;
   client.loadout = safeLoadout(request.loadout);
   client.upgrades = safeUpgrades(request.upgrades);
   client.additionPoints = clamp(Math.floor(Number(request.additionPoints) || 0), 0, 1000);
-  client.queueKey = queueKey(map, mode);
+  client.queueKey = queueKey(format, mode);
   let q = queues.get(client.queueKey) || [];
-  q = q.filter(item => item.socket.readyState === WebSocket.OPEN && !item.roomId);
-  const opponent = q.shift();
-  if (opponent) {
-    if (q.length) queues.set(client.queueKey, q); else queues.delete(client.queueKey);
-    client.queueKey = null;
-    opponent.queueKey = null;
-    createRoom(opponent, client, map, mode);
+  q = q.filter(item => item.socket.readyState === WebSocket.OPEN && !item.roomId && item !== client);
+  q.push(client);
+  if (q.length >= required) {
+    const players = q.splice(0, required);
+    for (const item of players) item.queueKey = null;
+    if (q.length) {
+      queues.set(queueKey(format, mode), q);
+      for (const item of q) send(item, { type: 'queued', playersQueued: q.length, required, format, mode });
+    } else queues.delete(queueKey(format, mode));
+    createRoom(players, format, mode);
   } else {
-    q.push(client);
     queues.set(client.queueKey, q);
-    send(client, { type: 'queued', position: 0, map, mode });
+    for (const item of q) send(item, { type: 'queued', playersQueued: q.length, required, format, mode });
   }
 }
 
-function newPlayer(client, index) {
+function spawnFor(index, format) {
+  const config = MATCH_FORMATS[format];
+  if (config.ffa) {
+    const angle = index / config.size * Math.PI * 2;
+    return { x: Math.sin(angle) * 12, z: Math.cos(angle) * 12, yaw: angle + Math.PI };
+  }
+  const side = index % 2;
+  const slot = Math.floor(index / 2);
+  const teamSize = config.size / 2;
+  const z = (slot - (teamSize - 1) / 2) * 2.5;
+  return { x: side === 0 ? -11 : 11, z, yaw: side === 0 ? Math.PI / 2 : -Math.PI / 2 };
+}
+
+function newPlayer(client, index, format) {
+  const config = MATCH_FORMATS[format];
+  const spawn = spawnFor(index, format);
   return {
     id: client.id,
     name: client.name,
     userId: client.userId,
     client,
-    x: index === 0 ? -7 : 7,
+    side: config.ffa ? index : index % 2,
+    x: spawn.x,
     y: 0,
-    z: index === 0 ? 7 : -7,
+    z: spawn.z,
     vx: 0, vy: 0, vz: 0,
-    yaw: index === 0 ? Math.PI / 4 : -3 * Math.PI / 4,
+    yaw: spawn.yaw,
     onGround: true,
-    input: { keys: [], yaw: 0, roll: false, crouch: false, sprint: false, sprinting: false, aim: false },
+    input: { keys: [], yaw: spawn.yaw, roll: false, crouch: false, sprint: false, sprinting: false, aim: false },
     stamina: 100,
     previousKeys: new Set(),
-    score: 0,
-    roundWins: 0,
     additionPoints: client.additionPoints || 0,
-    zoneHold: 0,
     lastSnapshot: 0,
     upgrades: client.upgrades || safeUpgrades({}),
     loadout: client.loadout || safeLoadout({})
   };
 }
-function createRoom(a, b, map, mode) {
-  const room = {
-    id: randomUUID(),
-    map,
-    mode,
-    players: [newPlayer(a, 0), newPlayer(b, 1)],
-    startedAt: Date.now(),
-    lastSnapshot: 0,
-    phase: 'playing',
-    round: 1,
-    resetAt: 0,
-    zoneOwner: null,
-    winnerId: null
-  };
-  rooms.set(room.id, room);
-  a.roomId = room.id; b.roomId = room.id;
+
+function sideVoteCounts(room) {
+  const counts = Object.fromEntries(MAPS.map(map => [map, 0]));
+  for (const map of room.votes.values()) if (Object.hasOwn(counts, map)) counts[map] += 1;
+  return counts;
+}
+
+function startRoom(room) {
+  if (room.phase !== 'mapVote') return;
+  const counts = sideVoteCounts(room);
+  const high = Math.max(0, ...Object.values(counts));
+  const finalists = high === 0 ? MAPS : MAPS.filter(map => counts[map] === high);
+  room.map = finalists[Math.floor(Math.random() * finalists.length)];
+  room.phase = 'playing';
+  room.startedAt = Date.now();
+  broadcast(room, { type: 'voteEnd', map: room.map, counts });
   for (const p of room.players) {
-    send(p.client, { type: 'matchFound', roomId: room.id, playerId: p.id, map, mode, round: 1, winsToMatch: WINS_TO_MATCH });
+    send(p.client, {
+      type: 'matchFound',
+      roomId: room.id,
+      playerId: p.id,
+      map: room.map,
+      mode: room.mode,
+      format: room.format,
+      side: p.side,
+      playerCount: room.players.length,
+      round: 1,
+      winsToMatch: WINS_TO_MATCH
+    });
   }
   broadcast(room, { type: 'notice', message: 'Match started. Hold the glowing center to score.' });
 }
-function broadcast(room, payload) { for (const p of room.players) send(p.client, payload); }
+
+function createRoom(clients, format, mode) {
+  const config = MATCH_FORMATS[format];
+  const room = {
+    id: randomUUID(),
+    map: null,
+    mode,
+    format,
+    players: clients.map((client, index) => newPlayer(client, index, format)),
+    sideCount: config.sides,
+    sideScores: Array(config.sides).fill(0),
+    sideRoundWins: Array(config.sides).fill(0),
+    sideHolds: Array(config.sides).fill(0),
+    votes: new Map(),
+    voteDeadline: Date.now() + 15000,
+    startedAt: Date.now(),
+    lastSnapshot: 0,
+    phase: 'mapVote',
+    round: 1,
+    resetAt: 0,
+    zoneOwner: null,
+    winnerSide: null
+  };
+  rooms.set(room.id, room);
+  for (const p of room.players) p.client.roomId = room.id;
+  const voteStart = {
+    type: 'voteStart',
+    maps: MAPS,
+    counts: sideVoteCounts(room),
+    playerCount: room.players.length,
+    seconds: 15,
+    format
+  };
+  broadcast(room, voteStart);
+}
+
+function broadcast(room, payload) {
+  for (const p of room.players) send(p.client, payload);
+}
 
 function resetRound(room) {
   room.round += 1;
   room.phase = 'playing';
   room.zoneOwner = null;
+  room.sideScores.fill(0);
+  room.sideHolds.fill(0);
   for (let i = 0; i < room.players.length; i++) {
     const p = room.players[i];
-    p.x = i === 0 ? -7 : 7;
+    const spawn = spawnFor(i, room.format);
+    p.x = spawn.x;
     p.y = 0;
-    p.z = i === 0 ? 7 : -7;
+    p.z = spawn.z;
     p.vx = 0; p.vy = 0; p.vz = 0;
+    p.yaw = spawn.yaw;
     p.score = 0;
-    p.zoneHold = 0;
     p.stamina = 100;
     p.input.keys = [];
     p.input.roll = false;
@@ -187,14 +264,15 @@ function resetRound(room) {
     p.previousKeys.clear();
   }
 }
-async function saveMatchResult(room, winnerId) {
+
+async function saveMatchResult(room, winnerSide) {
   if (!adminClient) return;
   await Promise.all(room.players.map(async p => {
     if (!p.userId || !UUID_RE.test(p.userId)) return;
-    const won = p.id === winnerId;
+    const won = p.side === winnerSide;
     const { data, error: readError } = await adminClient
       .from('worth_player_data')
-      .select('nickname,credits,match_wins,match_losses,round_wins,addition_points,upgrades,loadout,contracts')
+      .select('nickname,credits,match_wins,match_losses,round_wins,addition_points,upgrades,loadout,contracts,inventory')
       .eq('user_id', p.userId).maybeSingle();
     if (readError) { console.error('WORTH progress read failed:', readError.message); return; }
     const current = data || {};
@@ -205,11 +283,12 @@ async function saveMatchResult(room, winnerId) {
       credits,
       match_wins: (Number(current.match_wins) || 0) + (won ? 1 : 0),
       match_losses: (Number(current.match_losses) || 0) + (won ? 0 : 1),
-      round_wins: (Number(current.round_wins) || 0) + p.roundWins,
+      round_wins: (Number(current.round_wins) || 0) + (room.sideRoundWins[p.side] || 0),
       addition_points: p.additionPoints,
       upgrades: p.upgrades,
       loadout: p.loadout,
       contracts: current.contracts || {},
+      inventory: Array.isArray(current.inventory) ? current.inventory : [],
       updated_at: new Date().toISOString()
     };
     const { error } = await adminClient.from('worth_player_data').upsert(payload, { onConflict: 'user_id' });
@@ -218,45 +297,50 @@ async function saveMatchResult(room, winnerId) {
   }));
 }
 
-function endRound(room, winner) {
+function finishMatch(room, winnerSide, reason = null) {
+  if (room.phase === 'matchEnd') return;
+  room.phase = 'matchEnd';
+  room.winnerSide = winnerSide;
+  for (const p of room.players) {
+    const opponentWins = Math.max(0, ...room.sideRoundWins.filter((_, index) => index !== p.side));
+    send(p.client, {
+      type: 'matchEnd',
+      winner: p.side === winnerSide ? 'self' : 'opponent',
+      selfWins: room.sideRoundWins[p.side] || 0,
+      opponentWins,
+      reason
+    });
+  }
+  void saveMatchResult(room, winnerSide);
+  setTimeout(() => {
+    for (const p of room.players) {
+      p.client.roomId = null;
+      if (p.client.socket.readyState === WebSocket.OPEN) send(p.client, { type: 'backToLobby' });
+    }
+    rooms.delete(room.id);
+  }, 1800);
+}
+
+function endRound(room, winnerSide) {
   if (room.phase !== 'playing') return;
   room.phase = 'roundEnd';
-  winner.roundWins += 1;
-  const [a, b] = room.players;
+  room.sideRoundWins[winnerSide] += 1;
   for (const p of room.players) {
-    if (room.mode === 'addition' && p.id !== winner.id) p.additionPoints += 3;
+    const opponentWins = Math.max(0, ...room.sideRoundWins.filter((_, index) => index !== p.side));
+    if (room.mode === 'addition' && p.side !== winnerSide) p.additionPoints += 3;
     send(p.client, {
       type: 'roundEnd',
-      winner: p.id === winner.id ? 'self' : 'opponent',
-      selfWins: p.roundWins,
-      opponentWins: room.players.find(other => other.id !== p.id).roundWins,
+      winner: p.side === winnerSide ? 'self' : 'opponent',
+      selfWins: room.sideRoundWins[p.side] || 0,
+      opponentWins,
       additionPoints: p.additionPoints,
       round: room.round
     });
   }
-  if (winner.roundWins >= WINS_TO_MATCH) {
-    room.phase = 'matchEnd';
-    room.winnerId = winner.id;
-    for (const p of room.players) {
-      send(p.client, {
-        type: 'matchEnd',
-        winner: p.id === winner.id ? 'self' : 'opponent',
-        selfWins: p.roundWins,
-        opponentWins: room.players.find(other => other.id !== p.id).roundWins
-      });
-    }
-    void saveMatchResult(room, winner.id);
-    setTimeout(() => {
-      for (const p of room.players) {
-        p.client.roomId = null;
-        if (p.client.socket.readyState === WebSocket.OPEN) send(p.client, { type: 'backToLobby' });
-      }
-      rooms.delete(room.id);
-    }, 1800);
-  } else {
-    room.resetAt = Date.now() + 1800;
-  }
+  if (room.sideRoundWins[winnerSide] >= WINS_TO_MATCH) finishMatch(room, winnerSide);
+  else room.resetAt = Date.now() + 1800;
 }
+
 function updatePlayer(player, dt) {
   const keys = new Set(player.input.keys || []);
   const forward = { x: Math.sin(player.yaw), z: -Math.cos(player.yaw) };
@@ -303,40 +387,62 @@ function updatePlayer(player, dt) {
   if (player.y < 0) { player.y = 0; player.vy = 0; player.onGround = true; }
 }
 function tickRoom(room, dt, now) {
+  if (room.phase === 'mapVote') {
+    if (now >= room.voteDeadline) startRoom(room);
+    return;
+  }
   if (room.phase !== 'playing') {
     if (room.phase === 'roundEnd' && now >= room.resetAt) resetRound(room);
     return;
   }
-  // Focus mode is shared: when either competitor uses the head camera, the whole arena slows evenly.
   const timeScale = room.players.some(p => p.input.aim) ? 0.38 : 1;
   const simulationDt = dt * timeScale;
   for (const p of room.players) updatePlayer(p, simulationDt);
-  const [a, b] = room.players;
-  const inA = Math.hypot(a.x, a.z) < 2.7;
-  const inB = Math.hypot(b.x, b.z) < 2.7;
-  if (inA && !inB) { a.zoneHold += simulationDt * (1 + a.upgrades.zoneControl * .06); b.zoneHold = Math.max(0, b.zoneHold - simulationDt * .5); room.zoneOwner = a.id; }
-  else if (inB && !inA) { b.zoneHold += simulationDt * (1 + b.upgrades.zoneControl * .06); a.zoneHold = Math.max(0, a.zoneHold - simulationDt * .5); room.zoneOwner = b.id; }
-  else if (inA && inB) { a.zoneHold = Math.max(0, a.zoneHold - simulationDt * .8); b.zoneHold = Math.max(0, b.zoneHold - simulationDt * .8); room.zoneOwner = 'contested'; }
-  else { a.zoneHold = Math.max(0, a.zoneHold - simulationDt * .2); b.zoneHold = Math.max(0, b.zoneHold - simulationDt * .2); room.zoneOwner = null; }
-  for (const p of room.players) {
-    if (p.zoneHold >= POINT_SECONDS) {
-      p.zoneHold = 0; p.score += 1;
-      if (p.score >= WINS_TO_ROUND) { endRound(room, p); return; }
+
+  const occupiedSides = new Set();
+  for (const p of room.players) if (Math.hypot(p.x, p.z) < 2.7) occupiedSides.add(p.side);
+  if (occupiedSides.size === 1) {
+    const owningSide = [...occupiedSides][0];
+    room.zoneOwner = owningSide;
+    for (let side = 0; side < room.sideCount; side++) {
+      if (side === owningSide) room.sideHolds[side] += simulationDt;
+      else room.sideHolds[side] = Math.max(0, room.sideHolds[side] - simulationDt * 0.5);
+    }
+  } else if (occupiedSides.size > 1) {
+    room.zoneOwner = 'contested';
+    for (let side = 0; side < room.sideCount; side++) room.sideHolds[side] = Math.max(0, room.sideHolds[side] - simulationDt * 0.8);
+  } else {
+    room.zoneOwner = null;
+    for (let side = 0; side < room.sideCount; side++) room.sideHolds[side] = Math.max(0, room.sideHolds[side] - simulationDt * 0.2);
+  }
+
+  for (let side = 0; side < room.sideCount; side++) {
+    if (room.sideHolds[side] >= POINT_SECONDS) {
+      room.sideHolds[side] = 0;
+      room.sideScores[side] += 1;
+      if (room.sideScores[side] >= WINS_TO_ROUND) {
+        endRound(room, side);
+        return;
+      }
     }
   }
+
   if (now - room.lastSnapshot >= SNAPSHOT_MS) {
     room.lastSnapshot = now;
     for (const p of room.players) {
-      const opponent = room.players.find(other => other.id !== p.id);
+      const otherScores = room.sideScores.filter((_, index) => index !== p.side);
+      const otherRoundWins = room.sideRoundWins.filter((_, index) => index !== p.side);
       send(p.client, {
         type: 'snapshot',
         timeScale,
         selfId: p.id,
+        selfSide: p.side,
+        format: room.format,
         map: room.map,
-        players: room.players.map(q => ({ id: q.id, name: q.name, x: q.x, y: q.y, z: q.z, yaw: q.yaw, stamina: q.stamina, sprinting: q.input.sprinting, rolling: q.input.roll })),
-        score: { self: p.score, opponent: opponent.score },
-        roundWins: { self: p.roundWins, opponent: opponent.roundWins },
-        zoneOwner: room.zoneOwner === p.id ? 'self' : room.zoneOwner === opponent.id ? 'opponent' : room.zoneOwner === 'contested' ? 'contested' : null,
+        players: room.players.map(q => ({ id: q.id, name: q.name, side: q.side, x: q.x, y: q.y, z: q.z, yaw: q.yaw, stamina: q.stamina, sprinting: q.input.sprinting, rolling: q.input.roll })),
+        score: { self: room.sideScores[p.side] || 0, opponent: Math.max(0, ...otherScores) },
+        roundWins: { self: room.sideRoundWins[p.side] || 0, opponent: Math.max(0, ...otherRoundWins) },
+        zoneOwner: room.zoneOwner === p.side ? 'self' : room.zoneOwner === 'contested' ? 'contested' : room.zoneOwner === null ? null : 'opponent',
         serverTime: now
       });
     }
@@ -366,12 +472,24 @@ async function handleMessage(client, raw) {
     queueClient(client, msg);
     return;
   }
+  if (msg.type === 'mapVote') {
+    const room = rooms.get(client.roomId);
+    if (!room || room.phase !== 'mapVote' || !MAPS.includes(msg.map)) return;
+    room.votes.set(client.id, msg.map);
+    broadcast(room, { type: 'voteUpdate', counts: sideVoteCounts(room), voted: room.votes.size, playerCount: room.players.length });
+    if (room.votes.size >= room.players.length) startRoom(room);
+    return;
+  }
   if (msg.type === 'cancelQueue') { removeFromQueue(client); return; }
   if (msg.type === 'profileUpdate') {
     const room = rooms.get(client.roomId);
     const p = room?.players.find(q => q.client === client);
     if (p) {
       p.loadout = safeLoadout(msg.loadout);
+      if (typeof msg.nickname === 'string') {
+        client.name = safeName(msg.nickname);
+        p.name = client.name;
+      }
       if (room.mode === 'addition') {
         p.upgrades = safeUpgrades(msg.upgrades);
         p.additionPoints = clamp(Math.floor(Number(msg.additionPoints) || 0), 0, 1000);
@@ -423,13 +541,25 @@ wss.on('connection', socket => {
     removeFromQueue(client);
     const room = rooms.get(client.roomId);
     if (room && room.phase !== 'matchEnd') {
-      const remaining = room.players.find(p => p.client !== client);
-      if (remaining) {
-        send(remaining.client, { type: 'matchEnd', winner: 'self', reason: 'opponent-disconnected', selfWins: remaining.roundWins, opponentWins: 0 });
-        if (remaining.userId) void saveMatchResult(room, remaining.id);
-        remaining.client.roomId = null;
+      room.players = room.players.filter(p => p.client !== client);
+      if (room.phase === 'mapVote') {
+        for (const p of room.players) {
+          p.client.roomId = null;
+          send(p.client, { type: 'matchCancelled', message: 'A player left during map voting. Requeue when ready.' });
+        }
+        rooms.delete(room.id);
+      } else if (!room.players.length) {
+        rooms.delete(room.id);
+      } else {
+        const sides = [...new Set(room.players.map(p => p.side))];
+        if (room.format === '1v1v1') {
+          if (room.players.length === 1) finishMatch(room, room.players[0].side, 'opponent-disconnected');
+        } else if (sides.length === 1) {
+          finishMatch(room, sides[0], 'opponent-disconnected');
+        } else {
+          broadcast(room, { type: 'notice', message: 'A player disconnected. The match continues.' });
+        }
       }
-      rooms.delete(room.id);
     }
     sockets.delete(socket);
   });
