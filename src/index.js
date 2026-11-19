@@ -152,6 +152,7 @@ function newPlayer(client, index, format) {
     userId: client.userId,
     client,
     side: config.ffa ? index : index % 2,
+    spawnIndex: index,
     x: spawn.x,
     y: 0,
     z: spawn.z,
@@ -247,7 +248,7 @@ function resetRound(room) {
   room.sideHolds.fill(0);
   for (let i = 0; i < room.players.length; i++) {
     const p = room.players[i];
-    const spawn = spawnFor(i, room.format);
+    const spawn = spawnFor(p.spawnIndex, room.format);
     p.x = spawn.x;
     p.y = 0;
     p.z = spawn.z;
